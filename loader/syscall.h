@@ -7,6 +7,7 @@
 #define SYS_PROT_READ  1
 #define SYS_PROT_WRITE 2
 #define SYS_PROT_EXEC  4
+#define SYS_PROT_NONE  0
 
 #define SYS_MAP_PRIVATE   0x02
 #define SYS_MAP_ANONYMOUS 0x20
@@ -73,6 +74,42 @@ static inline void sys_exit(long code)
         : "rcx", "r11", "memory"
     );
     __builtin_unreachable();
+}
+
+static inline long sys_open(const char *pathname, long flags, long mode)
+{
+    long ret;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"((uint64_t)2), "D"(pathname), "S"(flags), "d"(mode)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
+static inline long sys_read(long fd, void *buf, size_t count)
+{
+    long ret;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"((uint64_t)0), "D"(fd), "S"(buf), "d"(count)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
+static inline long sys_close(long fd)
+{
+    long ret;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"((uint64_t)3), "D"(fd)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
 }
 
 #endif

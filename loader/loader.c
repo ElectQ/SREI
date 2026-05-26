@@ -2,8 +2,11 @@
 #include "llbin.h"
 #include "syscall.h"
 #include "resolve.h"
+#include "selfresolve.h"
 
 #define LLBIN_RTLD_DEFAULT ((void *)0xffffffffffffffffUL)
+#define SREI_CLEARHEADER 0x1
+#define SREI_CLEARMEMORY 0x2
 
 static inline void inline_memcpy(void *dst, const void *src, size_t n)
 {
@@ -45,8 +48,11 @@ uintptr_t srei_load(const uint8_t *data, size_t data_len,
     const char *name;
     void *sym;
     uint64_t *slot;
+    struct srei_resolver resolver;
 
-    (void)flags;
+    if (!dlsym_fn) {
+        srei_resolver_init(&resolver);
+    }
 
     if (data_len < sizeof(struct llbin_header))
         return 0;
@@ -88,7 +94,13 @@ uintptr_t srei_load(const uint8_t *data, size_t data_len,
             if (f->import_idx >= hdr->import_count)
                 continue;
             name = strings + imports[f->import_idx].name_off;
-            sym = dlsym_fn(LLBIN_RTLD_DEFAULT, name);
+
+            if (dlsym_fn) {
+                sym = dlsym_fn(LLBIN_RTLD_DEFAULT, name);
+            } else {
+                sym = srei_resolve(&resolver, name);
+            }
+
             if (sym)
                 *slot = (uint64_t)(uintptr_t)sym + (uint64_t)f->addend;
         }
@@ -121,6 +133,19 @@ uintptr_t srei_load(const uint8_t *data, size_t data_len,
                 break;
             }
         }
+    }
+
+    if (flags & SREI_CLEARHEADER) {
+        uint32_t hdr_sz = (uint32_t)sizeof(struct llbin_header);
+        for (i = 0; i < hdr_sz; i++)
+            ((uint8_t *)(uintptr_t)data)[i] = 0;
+    }
+
+    if (flags & SREI_CLEARMEMORY) {
+        sys_mprotect((void *)(uintptr_t)data, (size_t)data_len, SYS_PROT_READ | SYS_PROT_WRITE);
+        for (i = 0; i < (uint32_t)data_len; i++)
+            ((uint8_t *)(uintptr_t)data)[i] = 0;
+        sys_mprotect((void *)(uintptr_t)data, (size_t)data_len, SYS_PROT_NONE);
     }
 
     return (uintptr_t)base;

@@ -32,5 +32,12 @@ clean:
 
 .PHONY: all clean packer/loader loader test_so native_loader test
 
-test: test/payload.llbin native/native_loader
+test/test_selfresolve: test/test_selfresolve.c loader/loader.c loader/syscall.h loader/resolve.h loader/selfresolve.h packer/llbin.h
+	$(CC) $(CFLAGS) -Ipacker -o $@ test/test_selfresolve.c loader/loader.c -ldl
+
+test: test/payload.llbin native/native_loader test/test_selfresolve
+	@echo "=== Test 1: dlsym parameter ==="
 	./native/native_loader test/payload.llbin
+	@echo ""
+	@echo "=== Test 2: self-resolve (NULL dlsym) ==="
+	./test/test_selfresolve test/payload.llbin
