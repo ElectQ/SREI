@@ -18,6 +18,8 @@
 #define DT_SYMTAB     6
 #define DT_GNU_HASH   0x6ffffef5
 
+#define SREI_MAX_LIBS 32
+
 typedef struct {
     uint8_t  e_ident[EI_NIDENT];
     uint16_t e_type;
@@ -105,16 +107,126 @@ static inline uint64_t parse_hex64(const char *s, const char **end)
     return v;
 }
 
-static inline uintptr_t srei_find_lib_base(const char *libname, size_t libname_len)
+struct srei_lib_cache {
+    uintptr_t load_bias;
+    Elf64_Sym_C *symtab;
+    const char  *strtab;
+    uint32_t nbuckets;
+    uint32_t symoffset;
+    uint32_t *buckets;
+    uint32_t *chain;
+    int parsed;
+};
+
+struct srei_resolver {
+    int initialized;
+    struct srei_lib_cache libs[SREI_MAX_LIBS];
+    uint32_t nlibs;
+    uint32_t libc_idx;
+};
+
+static inline void srei_resolver_init(struct srei_resolver *r)
 {
+    for (uint32_t i = 0; i < (uint32_t)sizeof(*r); i++)
+        ((uint8_t *)r)[i] = 0;
+}
+
+static inline int srei_parse_lib(struct srei_lib_cache *lib, uintptr_t base)
+{
+    uint8_t *mbase = (uint8_t *)base;
+    if (mbase[0] != ELFMAG0 || mbase[1] != ELFMAG1 ||
+        mbase[2] != ELFMAG2 || mbase[3] != ELFMAG3)
+        return -1;
+
+    Elf64_Ehdr_C *ehdr = (Elf64_Ehdr_C *)mbase;
+    if (ehdr->e_ident[4] != ELFCLASS64)
+        return -1;
+
+    Elf64_Phdr_C *phdrs = (Elf64_Phdr_C *)(mbase + ehdr->e_phoff);
+
+    uint64_t elf_lo = (uint64_t)-1;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_vaddr < elf_lo)
+            elf_lo = phdrs[i].p_vaddr;
+    }
+
+    Elf64_Dyn_C *dyn = NULL;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_DYNAMIC)
+            dyn = (Elf64_Dyn_C *)(mbase + (phdrs[i].p_vaddr - elf_lo));
+    }
+
+    if (!dyn) return -1;
+
+    uint32_t *gnu_hash = NULL;
+    Elf64_Sym_C *symtab = NULL;
+    const char *strtab = NULL;
+
+    for (int i = 0; dyn[i].d_tag != DT_NULL; i++) {
+        switch (dyn[i].d_tag) {
+        case DT_SYMTAB:   symtab   = (Elf64_Sym_C *)(uintptr_t)dyn[i].d_val; break;
+        case DT_STRTAB:   strtab   = (const char *)(uintptr_t)dyn[i].d_val; break;
+        case DT_GNU_HASH: gnu_hash = (uint32_t *)(uintptr_t)dyn[i].d_val; break;
+        }
+    }
+
+    if (!symtab || !strtab || !gnu_hash) return -1;
+
+    uint32_t nbuckets  = gnu_hash[0];
+    uint32_t symoffset = gnu_hash[1];
+    uint32_t bloom_sz  = gnu_hash[2];
+
+    lib->load_bias = (uintptr_t)(base - elf_lo);
+    lib->symtab    = symtab;
+    lib->strtab    = strtab;
+    lib->nbuckets  = nbuckets;
+    lib->symoffset = symoffset;
+    lib->buckets   = &gnu_hash[4 + bloom_sz * 2];
+    lib->chain     = &gnu_hash[4 + bloom_sz * 2 + nbuckets];
+    lib->parsed    = 1;
+    return 0;
+}
+
+static inline void *srei_resolve_in_lib(struct srei_lib_cache *lib,
+                                         const char *name)
+{
+    if (!lib->parsed || !lib->symtab || !lib->strtab ||
+        !lib->buckets || !lib->chain)
+        return NULL;
+
+    uint32_t h = elf_gnu_hash(name);
+    uint32_t idx = lib->buckets[h % lib->nbuckets];
+
+    if (idx != 0) {
+        for (;;) {
+            uint32_t cv = lib->chain[idx - lib->symoffset];
+            if ((cv | 1) == (h | 1)) {
+                Elf64_Sym_C *sym = &lib->symtab[idx];
+                if (sym->st_shndx != 0 &&
+                    inline_strcmp(lib->strtab + sym->st_name, name) == 0) {
+                    return (void *)(lib->load_bias + sym->st_value);
+                }
+            }
+            if (cv & 1)
+                break;
+            idx++;
+        }
+    }
+
+    return NULL;
+}
+
+static inline void srei_resolver_setup(struct srei_resolver *r)
+{
+    if (r->initialized) return;
+    r->initialized = 1;
+
     long fd = sys_open("/proc/self/maps", 0, 0);
-    if (fd < 0)
-        return 0;
+    if (fd < 0) return;
 
     char buf[4096];
     long total = 0;
     long n;
-    uintptr_t result = 0;
 
     while ((n = sys_read(fd, buf + total, sizeof(buf) - 1 - total)) > 0)
         total += n;
@@ -122,7 +234,8 @@ static inline uintptr_t srei_find_lib_base(const char *libname, size_t libname_l
     buf[total] = 0;
 
     char *line = buf;
-    while (line && *line && !result) {
+    const char *last_path = NULL;
+    while (line && *line && r->nlibs < SREI_MAX_LIBS) {
         char *nl = line;
         while (*nl && *nl != '\n') nl++;
         int has_nl = (*nl == '\n');
@@ -132,130 +245,66 @@ static inline uintptr_t srei_find_lib_base(const char *libname, size_t libname_l
         const char *endptr;
         uint64_t start = parse_hex64(p, &endptr);
 
-        int spaces = 0;
-        const char *path = NULL;
-        for (p = line; *p; p++) {
-            if (*p == ' ') {
-                spaces++;
-                while (*(p + 1) == ' ') p++;
-                if (spaces == 5) { path = p + 1; break; }
+        if (*endptr == '-') {
+            parse_hex64(endptr + 1, &endptr);
+
+            int spaces = 0;
+            const char *path = NULL;
+            for (p = line; *p; p++) {
+                if (*p == ' ') {
+                    spaces++;
+                    while (*(p + 1) == ' ') p++;
+                    if (spaces == 5) { path = p + 1; break; }
+                }
+            }
+
+            if (path && *path == '/') {
+                if (last_path && inline_strcmp(path, last_path) == 0)
+                    goto next_line;
+                last_path = path;
+
+                uint32_t idx = r->nlibs;
+
+                const char *basename = path;
+                for (const char *s = path; *s; s++)
+                    if (*s == '/') basename = s + 1;
+
+                if (!r->libc_idx &&
+                    (inline_strncmp(basename, "libc-", 5) == 0 ||
+                     inline_strncmp(basename, "libc.so", 7) == 0)) {
+                    r->libc_idx = idx + 1;
+                }
+
+                if (srei_parse_lib(&r->libs[idx], (uintptr_t)start) == 0) {
+                    r->nlibs++;
+                    if (r->libc_idx == idx + 1 && idx != 0) {
+                        struct srei_lib_cache tmp = r->libs[0];
+                        r->libs[0] = r->libs[idx];
+                        r->libs[idx] = tmp;
+                        r->libc_idx = 1;
+                    }
+                }
             }
         }
 
-        if (path && *path == '/') {
-            const char *basename = path;
-            for (const char *s = path; *s; s++)
-                if (*s == '/') basename = s + 1;
-            if (inline_strncmp(basename, libname, libname_len) == 0)
-                result = (uintptr_t)start;
-        }
-
+    next_line:
         line = has_nl ? nl + 1 : nl;
     }
-
-    return result;
-}
-
-struct srei_resolver {
-    uintptr_t libc_base;
-    int initialized;
-    Elf64_Sym_C *symtab;
-    const char  *strtab;
-    uint32_t nbuckets;
-    uint32_t symoffset;
-    uint32_t *buckets;
-    uint32_t *chain;
-};
-
-static inline void srei_resolver_init(struct srei_resolver *r)
-{
-    r->libc_base = 0;
-    r->initialized = 0;
-    r->symtab = NULL;
-    r->strtab = NULL;
-    r->nbuckets = 0;
-    r->symoffset = 0;
-    r->buckets = NULL;
-    r->chain = NULL;
-}
-
-static inline void srei_resolver_setup(struct srei_resolver *r)
-{
-    if (r->initialized) return;
-    r->initialized = 1;
-
-    r->libc_base = srei_find_lib_base("libc-", 5);
-    if (!r->libc_base)
-        r->libc_base = srei_find_lib_base("libc.so", 7);
-    if (!r->libc_base)
-        return;
-
-    uint8_t *base = (uint8_t *)r->libc_base;
-    if (base[0] != ELFMAG0 || base[1] != ELFMAG1 || base[2] != ELFMAG2 || base[3] != ELFMAG3)
-        return;
-
-    Elf64_Ehdr_C *ehdr = (Elf64_Ehdr_C *)base;
-    if (ehdr->e_ident[4] != ELFCLASS64)
-        return;
-
-    Elf64_Phdr_C *phdrs = (Elf64_Phdr_C *)(base + ehdr->e_phoff);
-    Elf64_Dyn_C *dyn = NULL;
-    uint64_t elf_lo = (uint64_t)-1;
-
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_vaddr < elf_lo)
-            elf_lo = phdrs[i].p_vaddr;
-        if (phdrs[i].p_type == PT_DYNAMIC)
-            dyn = (Elf64_Dyn_C *)(base + (phdrs[i].p_vaddr - elf_lo));
-    }
-
-    if (!dyn) return;
-
-    uint32_t *gnu_hash = NULL;
-
-    for (int i = 0; dyn[i].d_tag != DT_NULL; i++) {
-        switch (dyn[i].d_tag) {
-        case DT_SYMTAB:   r->symtab = (Elf64_Sym_C *)(uintptr_t)dyn[i].d_val; break;
-        case DT_STRTAB:   r->strtab = (const char *)(uintptr_t)dyn[i].d_val; break;
-        case DT_GNU_HASH: gnu_hash  = (uint32_t *)(uintptr_t)dyn[i].d_val; break;
-        default: break;
-        }
-    }
-
-    if (!r->symtab || !r->strtab || !gnu_hash)
-        return;
-
-    r->nbuckets  = gnu_hash[0];
-    r->symoffset = gnu_hash[1];
-    uint32_t bloom_sz = gnu_hash[2];
-
-    r->buckets = &gnu_hash[4 + bloom_sz * 2];
-    r->chain   = &r->buckets[r->nbuckets];
 }
 
 static inline void *srei_resolve(struct srei_resolver *r, const char *name)
 {
     srei_resolver_setup(r);
 
-    if (!r->symtab || !r->strtab || !r->buckets || !r->chain)
-        return NULL;
+    if (r->libc_idx && r->libs[0].parsed) {
+        void *sym = srei_resolve_in_lib(&r->libs[0], name);
+        if (sym) return sym;
+    }
 
-    uint32_t h = elf_gnu_hash(name);
-    uint32_t idx = r->buckets[h % r->nbuckets];
-
-    if (idx != 0) {
-        for (;;) {
-            uint32_t cv = r->chain[idx - r->symoffset];
-            if ((cv | 1) == (h | 1)) {
-                Elf64_Sym_C *sym = &r->symtab[idx];
-                if (sym->st_shndx != 0 &&
-                    inline_strcmp(r->strtab + sym->st_name, name) == 0) {
-                    return (void *)(uintptr_t)(r->libc_base + sym->st_value);
-                }
-            }
-            if (cv & 1)
-                break;
-            idx++;
+    for (uint32_t i = 1; i < r->nlibs; i++) {
+        if (r->libs[i].parsed) {
+            void *sym = srei_resolve_in_lib(&r->libs[i], name);
+            if (sym) return sym;
         }
     }
 

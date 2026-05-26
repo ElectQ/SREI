@@ -1,0 +1,6 @@
+README.md
+python/srei.egg-info/PKG-INFO
+python/srei.egg-info/SOURCES.txt
+python/srei.egg-info/dependency_links.txt
+python/srei.egg-info/entry_points.txt
+python/srei.egg-info/top_level.txt

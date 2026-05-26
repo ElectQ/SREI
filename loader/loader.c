@@ -29,6 +29,7 @@ typedef void *(*srei_dlsym_fn)(void *, const char *);
 typedef void (*srei_init_fn)(void);
 typedef void (*srei_export_fn)(const void *, uint32_t);
 
+__attribute__((section(".text.entry")))
 uintptr_t srei_load(const uint8_t *data, size_t data_len,
                     uint32_t func_hash,
                     const void *user_data, uint32_t user_data_len,

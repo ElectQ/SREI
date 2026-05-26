@@ -73,6 +73,7 @@ static uint8_t            *image;
 
 static struct llbin_fixup  fixups[MAX_FIXUPS];
 static uint32_t            nfixups;
+static uint32_t            nrebase_fixups;
 
 static struct llbin_import imports[MAX_IMPORTS];
 static uint32_t            nimports;
@@ -134,6 +135,8 @@ static void add_fixup(uint32_t offset, uint8_t type,
     fixups[nfixups].reserved   = 0;
     fixups[nfixups].import_idx = import_idx;
     fixups[nfixups].addend     = addend;
+    if (type == LLBIN_FIXUP_REBASE)
+        nrebase_fixups++;
     nfixups++;
 }
 
@@ -643,7 +646,7 @@ int main(int argc, char *argv[])
         die("process_fixups_elf failed");
 
     printf("  fixups:  %u (%u rebase, %u import)\n", nfixups,
-           nfixups - nimports, nimports);
+           nrebase_fixups, nfixups - nrebase_fixups);
     printf("  imports: %u\n", nimports);
     for (uint32_t i = 0; i < nimports; i++)
         printf("    [%u] %s\n", i, strtab + imports[i].name_off);

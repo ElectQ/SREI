@@ -1,0 +1,14 @@
+Metadata-Version: 1.2
+Name: srei
+Version: 0.1.0
+Summary: Shellcode Reflective ELF Injection
+Home-page: UNKNOWN
+Author: SREI Project
+License: MIT
+Description: Converts Linux shared libraries (.so) into position-independent shellcode for in-memory execution. Self-contained pure Python.
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Topic :: Security
+Requires-Python: >=3.6

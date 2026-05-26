@@ -1,0 +1,3 @@
+[console_scripts]
+srei = srei:main
+
