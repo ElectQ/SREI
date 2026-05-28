@@ -25,7 +25,11 @@ Linux 版 sRDI（Shellcode Reflective DLL Injection）。纯 Python 实现，无
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-详细设计见 [study.md](study.md)。
+详细设计见 [docs/](docs/) 目录下的技术文档：
+- [设计理念与架构概览](docs/01-design-philosophy.md)
+- [ELF 关键结构与 llbin 预处理](docs/02-elf-structures-and-llbin.md)
+- [Loader 内部机制](docs/03-loader-internals.md)
+- [TLS 线程本地存储与 C++ 异常处理](docs/04-tls-and-ehframe.md)
 
 ## 快速开始
 
