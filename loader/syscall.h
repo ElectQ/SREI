@@ -112,4 +112,16 @@ static inline long sys_close(long fd)
     return ret;
 }
 
+static inline long sys_arch_prctl(long code, void *addr)
+{
+    long ret;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"((uint64_t)158), "D"(code), "S"(addr)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
 #endif

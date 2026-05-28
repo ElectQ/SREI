@@ -34,7 +34,6 @@ typedef int (*srei_pthread_key_create_fn)(srei_pthread_key_t *, void (*)(void *)
 typedef void *(*srei_pthread_getspecific_fn)(srei_pthread_key_t);
 typedef int (*srei_pthread_setspecific_fn)(srei_pthread_key_t, const void *);
 typedef void *(*srei_tls_get_addr_fn)(unsigned long *);
-typedef int (*srei_pthread_create_fn)(void *, void *, void *(*)(void *), void *);
 
 static srei_tls_get_addr_fn srei_tls_real_fn;
 static srei_pthread_getspecific_fn srei_tls_getspecific_fn;
@@ -46,48 +45,6 @@ static uint32_t srei_tls_init_sz;
 static uint32_t srei_tls_total_sz;
 static void *srei_tls_fallback_block;
 static int64_t srei_tls_tpoff;
-
-static srei_pthread_create_fn srei_real_pthread_create;
-
-static void *srei_thread_wrapper(void *arg)
-{
-    sys_write(2, "WRAP_IN\n", 8);
-    void *(*fn)(void *) = (void *(*)(void *))(uintptr_t)(
-        ((uint64_t *)(uintptr_t)arg)[0]);
-    void *real_arg = (void *)(uintptr_t)(
-        ((uint64_t *)(uintptr_t)arg)[1]);
-
-    if (srei_tls_tpoff != 0 && srei_tls_total_sz > 0) {
-        uintptr_t fs = 0;
-        if (sys_arch_prctl(0x1003, &fs) == 0 && fs != 0) {
-            uint8_t *tls_slot = (uint8_t *)(fs + srei_tls_tpoff);
-            if (srei_tls_init_sz > 0)
-                inline_memcpy(tls_slot, srei_tls_init_img, (size_t)srei_tls_init_sz);
-            {
-                uint32_t j;
-                for (j = srei_tls_init_sz; j < srei_tls_total_sz; j++)
-                    tls_slot[j] = 0;
-            }
-        }
-    }
-
-    sys_munmap((void *)(uintptr_t)arg, 4096);
-    return fn(real_arg);
-}
-
-static int srei_pthread_create_hook(void *thread, void *attr,
-                                     void *(*start_routine)(void *), void *arg)
-{
-    long page = sys_mmap((void *)0, 4096,
-                         SYS_PROT_READ | SYS_PROT_WRITE,
-                         SYS_MAP_PRIVATE | SYS_MAP_ANONYMOUS, -1, 0);
-    if (page < 0)
-        return srei_real_pthread_create(thread, attr, start_routine, arg);
-    ((uint64_t *)page)[0] = (uint64_t)(uintptr_t)start_routine;
-    ((uint64_t *)page)[1] = (uint64_t)(uintptr_t)arg;
-    return srei_real_pthread_create(thread, attr, srei_thread_wrapper,
-                                    (void *)(uintptr_t)page);
-}
 
 static int64_t srei_find_tls_slot(void)
 {
@@ -303,23 +260,6 @@ uintptr_t srei_load(const uint8_t *data, size_t data_len,
 
             if (sym)
                 *slot = (uint64_t)(uintptr_t)sym + (uint64_t)f->addend;
-
-            if (srei_tls_total_sz > 0 && sym) {
-                const char *n2 = name;
-                int is_ptc = (n2[0] == 'p' && n2[1] == 't' &&
-                              n2[2] == 'h' && n2[3] == 'r' &&
-                              n2[4] == 'e' && n2[5] == 'a' &&
-                              n2[6] == 'd' && n2[7] == '_' &&
-                              n2[8] == 'c' && n2[9] == 'r' &&
-                              n2[10] == 'e' && n2[11] == 'a' &&
-                              n2[12] == 't' && n2[13] == 'e' &&
-                              n2[14] == '\0');
-                if (is_ptc && srei_tls_tpoff != 0) {
-                    srei_real_pthread_create = (srei_pthread_create_fn)(uintptr_t)sym;
-                    *slot = (uint64_t)(uintptr_t)srei_pthread_create_hook;
-                    sys_write(2, "PTHREAD_HOOK\n", 13);
-                }
-            }
         } else if (f->type == LLBIN_FIXUP_TLS_MODULE) {
             *slot = (uint64_t)SREI_TLS_SENTINEL;
         } else if (f->type == LLBIN_FIXUP_TLS_OFFSET) {
@@ -327,20 +267,6 @@ uintptr_t srei_load(const uint8_t *data, size_t data_len,
                 srei_tls_tpoff = srei_find_tls_slot();
             if (srei_tls_tpoff != 0)
                 *slot = (uint64_t)(srei_tls_tpoff + f->addend);
-            {
-                char _buf[64];
-                int _n = 0;
-                long _v = srei_tls_tpoff;
-                _buf[_n++] = 'T'; _buf[_n++] = 'L'; _buf[_n++] = 'S';
-                _buf[_n++] = '=';
-                if (_v < 0) { _buf[_n++] = '-'; _v = -_v; }
-                char _tmp[20]; int _t = 0;
-                if (_v == 0) _tmp[_t++] = '0';
-                while (_v > 0) { _tmp[_t++] = '0' + (_v % 10); _v /= 10; }
-                while (_t > 0) _buf[_n++] = _tmp[--_t];
-                _buf[_n++] = '\n';
-                sys_write(2, _buf, _n);
-            }
         }
     }
 

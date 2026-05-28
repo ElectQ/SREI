@@ -360,10 +360,10 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
         ((m) == EM_ARM     && (t) == R_ARM_TLS_DTPMOD32) )
 
     #define IS_TLS_OFFSET(m, t) ( \
-        ((m) == EM_X86_64  && (t) == R_X86_64_DTPOFF64) || \
-        ((m) == EM_AARCH64 && (t) == R_AARCH64_TLS_DTPREL64) || \
-        ((m) == EM_386     && (t) == R_386_TLS_DTPOFF32) || \
-        ((m) == EM_ARM     && (t) == R_ARM_TLS_DTPOFF32) )
+        ((m) == EM_X86_64  && ((t) == R_X86_64_DTPOFF64 || (t) == R_X86_64_TPOFF64)) || \
+        ((m) == EM_AARCH64 && ((t) == R_AARCH64_TLS_DTPREL64 || (t) == R_AARCH64_TLS_TPREL64)) || \
+        ((m) == EM_386     && ((t) == R_386_TLS_DTPOFF32 || (t) == R_386_TLS_TPOFF32)) || \
+        ((m) == EM_ARM     && ((t) == R_ARM_TLS_DTPOFF32 || (t) == R_ARM_TLS_TPOFF32)) )
 
     size_t slot_sz = sizeof(Elf_Addr);
 
@@ -417,6 +417,8 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
                     Elf_Addr zero = 0;
                     memcpy(image + off, &zero, slot_sz);
                 }
+                add_fixup((uint32_t)off, LLBIN_FIXUP_TLS_OFFSET, 0,
+                          (int64_t)tbl[i].r_addend);
             }
         }
     }
@@ -467,6 +469,7 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
                     Elf_Addr zero = 0;
                     memcpy(image + off, &zero, slot_sz);
                 }
+                add_fixup((uint32_t)off, LLBIN_FIXUP_TLS_OFFSET, 0, 0);
             }
         }
     }

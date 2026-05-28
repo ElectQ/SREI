@@ -69,6 +69,7 @@ R_X86_64_JUMP_SLOT = 7
 R_X86_64_RELATIVE = 8
 R_X86_64_DTPMOD64 = 16
 R_X86_64_DTPOFF64 = 17
+R_X86_64_TPOFF64 = 18
 R_X86_64_IRELATIVE = 37
 
 R_AARCH64_ABS64 = 257
@@ -200,7 +201,7 @@ def _is_tls_module(machine, rtype):
 
 def _is_tls_offset(machine, rtype):
     if machine == EM_X86_64:
-        return rtype == R_X86_64_DTPOFF64
+        return rtype in (R_X86_64_DTPOFF64, R_X86_64_TPOFF64)
     return False
 
 
@@ -519,6 +520,7 @@ def process_elf_relocations(st, data):
                                      r_addend & slot_mask)
                 else:
                     struct.pack_into(slot_fmt, st.image, img_off, 0)
+                st.add_fixup(img_off, LLBIN_FIXUP_TLS_OFFSET, 0, r_addend)
 
     def process_rel(table_addr, table_sz):
         if table_addr == 0 or table_sz == 0 or rel_ent == 0:
