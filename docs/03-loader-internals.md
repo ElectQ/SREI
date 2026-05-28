@@ -68,6 +68,8 @@ static inline int sys_mprotect(void *addr, size_t len, int prot)
 
 用于设置内存段的权限属性(读/写/执行)。在 ELF 加载过程中,Loader 先以 `PROT_READ | PROT_WRITE` 映射所有段,完成重定位修复后再根据 ELF `p_flags` 设置最终权限。对于启用了 RELRO (Read-Only After Relocation) 的段,`sys_mprotect` 在重定位完成后将 `.got` 等区域设置为只读,增强安全性。
 
+**页对齐处理：** Linux 的 `mprotect` 系统调用要求 `addr` 参数必须是页对齐的（4096 字节对齐），否则返回 `EINVAL`。然而 llbin 段表中记录的偏移直接来自 ELF 的 PT_LOAD vaddr，不保证页对齐——例如 Rust cdylib 的代码段起始偏移为 `0x15d0`。因此在调用 `sys_mprotect` 之前，Loader 需要对每个段执行页对齐处理：将起始地址向下对齐到 `addr & ~0xfff`，将结束地址向上扩展到 `(end + 0xfff) & ~0xfff`。这一处理确保所有 ELF 文件（包括 Rust、C、C++ 编译产生的各种段布局）都能被正确设置权限。
+
 ### sys_munmap (系统调用号 11)
 
 ```c
@@ -155,7 +157,7 @@ Loader 使用 `-Os`(优化代码大小)而非 `-O2`(优化执行速度)进行编
 - `-O2` 编译:Loader 约 5140 字节。`-O2` 的激进内联策略会将所有 `static inline` 函数(包括 9 个系统调用封装、哈希函数、ELF 解析辅助函数等)在每个调用点展开,导致代码膨胀。
 - `-Os` 编译:编译器会做出更合理的内联决策,仅在确实有利于减小编码体积时才内联函数调用。
 
-启用 TLS 支持和 eh_frame 后,最终 Loader 大小为 5296 字节。对于 shellcode 场景,每一个字节都很重要——shellcode 通常通过网络传输或在受限环境中执行,更小的体积意味着更低的检测率和更高的可靠性。`-Os` 的代价是某些非关键路径的执行速度略慢,但对于一次性执行的 Loader 来说,这个代价完全可以接受。
+启用 TLS 支持和 eh_frame 后,最终 Loader 大小为 5560 字节（含 mprotect 页对齐逻辑）。对于 shellcode 场景,每一个字节都很重要——shellcode 通常通过网络传输或在受限环境中执行,更小的体积意味着更低的检测率和更高的可靠性。`-Os` 的代价是某些非关键路径的执行速度略慢,但对于一次性执行的 Loader 来说,这个代价完全可以接受。
 
 ## Word-aligned memcpy
 

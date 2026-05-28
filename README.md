@@ -15,7 +15,7 @@ Linux 版 sRDI（Shellcode Reflective DLL Injection）。纯 Python 实现，无
 │  │ (输入)   │    │ (Python) │    │ (中间格式)│    │ (输出)   │  │
 │  └──────────┘    └──────────┘    └──────────┘    └──────────┘  │
 │                                                                 │
-│  Shellcode = Bootstrap(68B) + Loader(5296B) + llbin + UserData│
+│  Shellcode = Bootstrap(68B) + Loader(5560B) + llbin + UserData│
 │                                                                 │
 │  运行时:                                                        │
 │  Bootstrap → 设置参数 → 调用 srei_load()                       │
@@ -67,6 +67,28 @@ int worker(const char *msg, unsigned int len) {
 gcc -Os -shared -fPIC -o payload.so payload.c
 ```
 
+Rust (`cargo new --lib payload && cd payload`):
+
+```toml
+# Cargo.toml
+[lib]
+crate-type = ["cdylib"]
+```
+
+```rust
+// src/lib.rs
+#[no_mangle]
+pub extern "C" fn worker(data: *const u8, len: u32) -> i32 {
+    eprintln!("[rust] hello from shellcode!");
+    0
+}
+```
+
+```bash
+cargo build --release
+# target/release/libpayload.so
+```
+
 **核心条件:** 位置无关代码 (PIC/PIE) + 重定位信息 + 导出函数 = 可转 shellcode
 
 **支持特性:** TLS (`__thread` 变量)、C++ 异常 (throw/catch)、IFUNC (memset/memcpy 等)、
@@ -85,7 +107,7 @@ Linux 3.10+ (x86_64) | Python 3.6+
 **支持特性:** TLS (`__thread`)、C++ 异常 (throw/catch)、IFUNC (memset/memcpy 等)、
 依赖库自动加载 (libz/libcrypto/libcurl 等)。
 
-**已验证:** C、C++
+**已验证:** C、C++、Rust (`cdylib` + `std`)
 
 ## TODO
 

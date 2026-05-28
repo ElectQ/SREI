@@ -348,15 +348,20 @@ uintptr_t srei_load(const uint8_t *data, size_t data_len,
 
     segs = (const struct llbin_segment *)(data + hdr->strings_off + hdr->strings_size);
     for (i = 0; i < hdr->seg_count; i++) {
-        if ((segs[i].prot & LLBIN_SEG_RELRO) && segs[i].size > 0)
-            sys_mprotect(base + segs[i].offset, (size_t)segs[i].size, SYS_PROT_READ);
-    }
-    for (i = 0; i < hdr->seg_count; i++) {
-        if (segs[i].prot & LLBIN_SEG_RELRO)
+        if (segs[i].size == 0)
             continue;
-        long prot = (long)(segs[i].prot & ~LLBIN_SEG_RELRO);
-        if (prot && segs[i].size > 0)
-            sys_mprotect(base + segs[i].offset, (size_t)segs[i].size, prot);
+        uintptr_t seg_start = (uintptr_t)base + segs[i].offset;
+        uintptr_t seg_end = seg_start + segs[i].size;
+        uintptr_t page_start = seg_start & ~(uintptr_t)0xfff;
+        uintptr_t page_end = (seg_end + 0xfff) & ~(uintptr_t)0xfff;
+        long mp_size = (long)(page_end - page_start);
+        if (segs[i].prot & LLBIN_SEG_RELRO) {
+            sys_mprotect((void *)page_start, (size_t)mp_size, SYS_PROT_READ);
+        } else {
+            long prot = (long)(segs[i].prot & ~LLBIN_SEG_RELRO);
+            if (prot)
+                sys_mprotect((void *)page_start, (size_t)mp_size, prot);
+        }
     }
 
     if (hdr->eh_frame_size > 0) {
