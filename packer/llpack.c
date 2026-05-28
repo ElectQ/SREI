@@ -74,6 +74,7 @@ static uint8_t            *image;
 static struct llbin_fixup  fixups[MAX_FIXUPS];
 static uint32_t            nfixups;
 static uint32_t            nrebase_fixups;
+static uint32_t            nirel_fixups;
 
 static struct llbin_import imports[MAX_IMPORTS];
 static uint32_t            nimports;
@@ -87,8 +88,27 @@ static int                 has_entry;
 static struct llbin_init   inits[MAX_INITS];
 static uint32_t            ninits;
 
+static struct llbin_init   finis[MAX_INITS];
+static uint32_t            nfinis;
+
 static struct llbin_export exports[MAX_EXPORTS];
 static uint32_t            nexports;
+
+#define MAX_NEEDED 32
+static uint32_t            needed_str[MAX_NEEDED];
+static uint32_t            nneeded;
+static const char         *elf_dynstr;
+
+#ifndef SHF_ALLOC
+#define SHF_ALLOC 0x2
+#endif
+static uint32_t            eh_frame_off;
+static uint32_t            eh_frame_size;
+
+static uint32_t            tls_init_off;
+static uint32_t            tls_init_size;
+static uint32_t            tls_total_size;
+static uint32_t            tls_align;
 
 static void die(const char *msg)
 {
@@ -137,6 +157,8 @@ static void add_fixup(uint32_t offset, uint8_t type,
     fixups[nfixups].addend     = addend;
     if (type == LLBIN_FIXUP_REBASE)
         nrebase_fixups++;
+    else if (type == LLBIN_FIXUP_IRELATIVE)
+        nirel_fixups++;
     nfixups++;
 }
 
@@ -189,7 +211,35 @@ static int build_image_elf(const uint8_t *buf, size_t len)
     if (lo >= hi) die("no PT_LOAD segments");
 
     base_vmaddr = lo;
+
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const Elf_Phdr *phdr =
+            (const Elf_Phdr *)(buf + ehdr->e_phoff + i * ehdr->e_phentsize);
+        if (phdr->p_type == PT_GNU_RELRO) {
+            if (nsegs >= MAX_SEGS) die("too many segments");
+            segs[nsegs].vmaddr   = phdr->p_vaddr;
+            segs[nsegs].vmsize   = phdr->p_memsz;
+            segs[nsegs].fileoff  = phdr->p_offset;
+            segs[nsegs].filesize = phdr->p_filesz;
+            segs[nsegs].initprot = 4 | LLBIN_SEG_RELRO;
+            snprintf(segs[nsegs].name, 16, "RELRO");
+            nsegs++;
+            break;
+        }
+    }
     total_size  = ((hi - lo) + 0xFFFULL) & ~0xFFFULL;
+
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const Elf_Phdr *phdr =
+            (const Elf_Phdr *)(buf + ehdr->e_phoff + i * ehdr->e_phentsize);
+        if (phdr->p_type == 7) {
+            tls_init_off   = (uint32_t)(phdr->p_vaddr - base_vmaddr);
+            tls_init_size  = (uint32_t)phdr->p_filesz;
+            tls_total_size = (uint32_t)phdr->p_memsz;
+            tls_align      = (uint32_t)phdr->p_align;
+            break;
+        }
+    }
 
     image = calloc(1, (size_t)total_size);
     if (!image) die("out of memory");
@@ -250,6 +300,10 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
         case DT_PLTREL:   pltrel_type = (int)d->d_un.d_val; break;
         case DT_SYMTAB:   symtab_addr = d->d_un.d_ptr; break;
         case DT_STRTAB:   strtab_addr = d->d_un.d_ptr; break;
+        case DT_NEEDED:
+            if (nneeded < MAX_NEEDED)
+                needed_str[nneeded++] = (uint32_t)d->d_un.d_val;
+            break;
         }
     }
 
@@ -259,6 +313,7 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
         (const Elf_Sym *)(image + symtab_addr - base_vmaddr) : NULL;
     const char *dynstr = strtab_addr ?
         (const char *)(image + strtab_addr - base_vmaddr) : NULL;
+    elf_dynstr = dynstr;
 
     uint16_t machine = ehdr->e_machine;
 
@@ -269,6 +324,13 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
         ((m) == EM_ARM     && (t) == R_ARM_RELATIVE) || \
         ((m) == EM_MIPS    && (t) == R_MIPS_REL32 && (s) == 0) || \
         ((m) == EM_SPARC   && (t) == R_SPARC_RELATIVE) )
+
+    #define IS_IRELATIVE(m, t) ( \
+        ((m) == EM_X86_64  && (t) == R_X86_64_IRELATIVE) || \
+        ((m) == EM_AARCH64 && (t) == R_AARCH64_IRELATIVE) || \
+        ((m) == EM_386     && (t) == R_386_IRELATIVE) || \
+        ((m) == EM_ARM     && (t) == R_ARM_IRELATIVE) || \
+        ((m) == EM_SPARC   && (t) == R_SPARC_IRELATIVE) )
 
     #define IS_IMPORT(m, t, s) ( \
         ((m) == EM_X86_64  && ((t) == R_X86_64_GLOB_DAT || \
@@ -288,8 +350,20 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
                                (t) == R_MIPS_JUMP_SLOT || \
                                ((t) == R_MIPS_REL32 && (s) > 0))) || \
         ((m) == EM_SPARC   && ((t) == R_SPARC_GLOB_DAT || \
-                               (t) == R_SPARC_JMP_SLOT || \
-                               (t) == R_SPARC_32)) )
+                                (t) == R_SPARC_JMP_SLOT || \
+                                (t) == R_SPARC_32)) )
+
+    #define IS_TLS_MODULE(m, t) ( \
+        ((m) == EM_X86_64  && (t) == R_X86_64_DTPMOD64) || \
+        ((m) == EM_AARCH64 && (t) == R_AARCH64_TLS_DTPMOD64) || \
+        ((m) == EM_386     && (t) == R_386_TLS_DTPMOD32) || \
+        ((m) == EM_ARM     && (t) == R_ARM_TLS_DTPMOD32) )
+
+    #define IS_TLS_OFFSET(m, t) ( \
+        ((m) == EM_X86_64  && (t) == R_X86_64_DTPOFF64) || \
+        ((m) == EM_AARCH64 && (t) == R_AARCH64_TLS_DTPREL64) || \
+        ((m) == EM_386     && (t) == R_386_TLS_DTPOFF32) || \
+        ((m) == EM_ARM     && (t) == R_ARM_TLS_DTPOFF32) )
 
     size_t slot_sz = sizeof(Elf_Addr);
 
@@ -310,14 +384,39 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
                 Elf_Addr val = (Elf_Addr)tbl[i].r_addend;
                 memcpy(image + off, &val, slot_sz);
                 add_fixup((uint32_t)off, LLBIN_FIXUP_REBASE, 0, 0);
+            } else if (IS_IRELATIVE(machine, type)) {
+                Elf_Addr val = (Elf_Addr)tbl[i].r_addend;
+                memcpy(image + off, &val, slot_sz);
+                add_fixup((uint32_t)off, LLBIN_FIXUP_IRELATIVE, 0, 0);
             } else if (IS_IMPORT(machine, type, sym) &&
                        symtab && dynstr && sym > 0) {
-                const char *name = dynstr + symtab[sym].st_name;
-                uint16_t idx = find_or_add_import_raw(name);
+                if (symtab[sym].st_shndx != 0) {
+                    Elf_Addr val = symtab[sym].st_value + (Elf_Addr)tbl[i].r_addend;
+                    memcpy(image + off, &val, slot_sz);
+                    add_fixup((uint32_t)off, LLBIN_FIXUP_REBASE, 0, 0);
+                } else {
+                    const char *name = dynstr + symtab[sym].st_name;
+                    uint16_t idx = find_or_add_import_raw(name);
+                    Elf_Addr zero = 0;
+                    memcpy(image + off, &zero, slot_sz);
+                    add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
+                              tbl[i].r_addend);
+                }
+            } else if (IS_TLS_MODULE(machine, type)) {
                 Elf_Addr zero = 0;
                 memcpy(image + off, &zero, slot_sz);
-                add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
-                          tbl[i].r_addend);
+                add_fixup((uint32_t)off, LLBIN_FIXUP_TLS_MODULE, 0, 0);
+            } else if (IS_TLS_OFFSET(machine, type)) {
+                if (sym > 0 && symtab && symtab[sym].st_shndx != 0) {
+                    Elf_Addr val = symtab[sym].st_value + (Elf_Addr)tbl[i].r_addend;
+                    memcpy(image + off, &val, slot_sz);
+                } else if (sym == 0) {
+                    Elf_Addr val = (Elf_Addr)tbl[i].r_addend;
+                    memcpy(image + off, &val, slot_sz);
+                } else {
+                    Elf_Addr zero = 0;
+                    memcpy(image + off, &zero, slot_sz);
+                }
             }
         }
     }
@@ -337,16 +436,37 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
 
             if (IS_RELATIVE(machine, type, sym)) {
                 add_fixup((uint32_t)off, LLBIN_FIXUP_REBASE, 0, 0);
+            } else if (IS_IRELATIVE(machine, type)) {
+                add_fixup((uint32_t)off, LLBIN_FIXUP_IRELATIVE, 0, 0);
             } else if (IS_IMPORT(machine, type, sym) &&
                        symtab && dynstr && sym > 0) {
-                Elf_Addr addend;
-                memcpy(&addend, image + off, slot_sz);
-                const char *name = dynstr + symtab[sym].st_name;
-                uint16_t idx = find_or_add_import_raw(name);
+                if (symtab[sym].st_shndx != 0) {
+                    Elf_Addr val = symtab[sym].st_value;
+                    memcpy(image + off, &val, slot_sz);
+                    add_fixup((uint32_t)off, LLBIN_FIXUP_REBASE, 0, 0);
+                } else {
+                    Elf_Addr addend;
+                    memcpy(&addend, image + off, slot_sz);
+                    const char *name = dynstr + symtab[sym].st_name;
+                    uint16_t idx = find_or_add_import_raw(name);
+                    Elf_Addr zero = 0;
+                    memcpy(image + off, &zero, slot_sz);
+                    add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
+                              (int64_t)addend);
+                }
+            } else if (IS_TLS_MODULE(machine, type)) {
                 Elf_Addr zero = 0;
                 memcpy(image + off, &zero, slot_sz);
-                add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
-                          (int64_t)addend);
+                add_fixup((uint32_t)off, LLBIN_FIXUP_TLS_MODULE, 0, 0);
+            } else if (IS_TLS_OFFSET(machine, type)) {
+                if (sym > 0 && symtab && symtab[sym].st_shndx != 0) {
+                    Elf_Addr val = symtab[sym].st_value;
+                    memcpy(image + off, &val, slot_sz);
+                } else if (sym == 0) {
+                } else {
+                    Elf_Addr zero = 0;
+                    memcpy(image + off, &zero, slot_sz);
+                }
             }
         }
     }
@@ -361,16 +481,27 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
                    (unsigned long long)count);
 
             for (uint64_t i = 0; i < count; i++) {
+                uint32_t type = ELF_R_TYPE(tbl[i].r_info);
                 uint32_t sym_idx = ELF_R_SYM(tbl[i].r_info);
                 uint64_t off = tbl[i].r_offset - base_vmaddr;
 
-                if (symtab && dynstr && sym_idx > 0) {
-                    const char *name = dynstr + symtab[sym_idx].st_name;
-                    uint16_t idx = find_or_add_import_raw(name);
-                    Elf_Addr zero = 0;
-                    memcpy(image + off, &zero, slot_sz);
-                    add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
-                              tbl[i].r_addend);
+                if (IS_IRELATIVE(machine, type)) {
+                    Elf_Addr val = (Elf_Addr)tbl[i].r_addend;
+                    memcpy(image + off, &val, slot_sz);
+                    add_fixup((uint32_t)off, LLBIN_FIXUP_IRELATIVE, 0, 0);
+                } else if (symtab && dynstr && sym_idx > 0) {
+                    if (symtab[sym_idx].st_shndx != 0) {
+                        Elf_Addr val = symtab[sym_idx].st_value + (Elf_Addr)tbl[i].r_addend;
+                        memcpy(image + off, &val, slot_sz);
+                        add_fixup((uint32_t)off, LLBIN_FIXUP_REBASE, 0, 0);
+                    } else {
+                        const char *name = dynstr + symtab[sym_idx].st_name;
+                        uint16_t idx = find_or_add_import_raw(name);
+                        Elf_Addr zero = 0;
+                        memcpy(image + off, &zero, slot_sz);
+                        add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
+                                  tbl[i].r_addend);
+                    }
                 }
             }
         } else {
@@ -382,25 +513,37 @@ static int process_fixups_elf(const uint8_t *buf, size_t len)
                    (unsigned long long)count);
 
             for (uint64_t i = 0; i < count; i++) {
+                uint32_t type = ELF_R_TYPE(tbl[i].r_info);
                 uint32_t sym_idx = ELF_R_SYM(tbl[i].r_info);
                 uint64_t off = tbl[i].r_offset - base_vmaddr;
 
-                if (symtab && dynstr && sym_idx > 0) {
-                    const char *name = dynstr + symtab[sym_idx].st_name;
-                    uint16_t idx = find_or_add_import_raw(name);
-                    Elf_Addr addend;
-                    memcpy(&addend, image + off, slot_sz);
-                    Elf_Addr zero = 0;
-                    memcpy(image + off, &zero, slot_sz);
-                    add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
-                              (int64_t)addend);
+                if (IS_IRELATIVE(machine, type)) {
+                    add_fixup((uint32_t)off, LLBIN_FIXUP_IRELATIVE, 0, 0);
+                } else if (symtab && dynstr && sym_idx > 0) {
+                    if (symtab[sym_idx].st_shndx != 0) {
+                        Elf_Addr val = symtab[sym_idx].st_value;
+                        memcpy(image + off, &val, slot_sz);
+                        add_fixup((uint32_t)off, LLBIN_FIXUP_REBASE, 0, 0);
+                    } else {
+                        const char *name = dynstr + symtab[sym_idx].st_name;
+                        uint16_t idx = find_or_add_import_raw(name);
+                        Elf_Addr addend;
+                        memcpy(&addend, image + off, slot_sz);
+                        Elf_Addr zero = 0;
+                        memcpy(image + off, &zero, slot_sz);
+                        add_fixup((uint32_t)off, LLBIN_FIXUP_IMPORT, idx,
+                                  (int64_t)addend);
+                    }
                 }
             }
         }
     }
 
     #undef IS_RELATIVE
+    #undef IS_IRELATIVE
     #undef IS_IMPORT
+    #undef IS_TLS_MODULE
+    #undef IS_TLS_OFFSET
 
     return 0;
 }
@@ -426,15 +569,17 @@ static int process_inits_elf(const uint8_t *buf, size_t len)
     uint64_t dyn_off = dyn_phdr->p_vaddr - base_vmaddr;
     const Elf_Dyn *dyn = (const Elf_Dyn *)(image + dyn_off);
 
-    uint64_t dt_init = 0;
-    uint64_t dt_init_array = 0;
-    uint64_t dt_init_arraysz = 0;
+    uint64_t dt_init = 0, dt_init_array = 0, dt_init_arraysz = 0;
+    uint64_t dt_fini = 0, dt_fini_array = 0, dt_fini_arraysz = 0;
 
     for (const Elf_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
         switch (d->d_tag) {
         case DT_INIT:         dt_init         = d->d_un.d_ptr; break;
         case DT_INIT_ARRAY:   dt_init_array   = d->d_un.d_ptr; break;
         case DT_INIT_ARRAYSZ: dt_init_arraysz = d->d_un.d_val; break;
+        case DT_FINI:         dt_fini         = d->d_un.d_ptr; break;
+        case DT_FINI_ARRAY:   dt_fini_array   = d->d_un.d_ptr; break;
+        case DT_FINI_ARRAYSZ: dt_fini_arraysz = d->d_un.d_val; break;
         }
     }
 
@@ -468,6 +613,39 @@ static int process_inits_elf(const uint8_t *buf, size_t len)
                 die("init table overflow");
             inits[ninits].offset = (uint64_t)entries[i] - base_vmaddr;
             ninits++;
+        }
+    }
+
+    if (dt_fini != 0) {
+        if (nfinis < MAX_INITS) {
+            finis[nfinis].offset = dt_fini - base_vmaddr;
+            nfinis++;
+        }
+    }
+
+    if (dt_fini_array != 0 && dt_fini_arraysz != 0) {
+        uint64_t arr_fileoff = 0;
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            const Elf_Phdr *phdr =
+                (const Elf_Phdr *)(buf + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (phdr->p_type == PT_LOAD &&
+                dt_fini_array >= phdr->p_vaddr &&
+                dt_fini_array < phdr->p_vaddr + phdr->p_memsz) {
+                arr_fileoff = dt_fini_array - phdr->p_vaddr + phdr->p_offset;
+                break;
+            }
+        }
+        if (arr_fileoff == 0) arr_fileoff = dt_fini_array;
+
+        uint32_t count = (uint32_t)(dt_fini_arraysz / sizeof(Elf_Addr));
+        const Elf_Addr *entries = (const Elf_Addr *)(buf + arr_fileoff);
+
+        for (uint32_t i = 0; i < count; i++) {
+            if (entries[i] == 0) continue;
+            if (nfinis >= MAX_INITS)
+                die("fini table overflow");
+            finis[nfinis].offset = (uint64_t)entries[i] - base_vmaddr;
+            nfinis++;
         }
     }
 
@@ -529,6 +707,50 @@ static int process_exports_elf(const uint8_t *buf, size_t len)
     return 0;
 }
 
+static int process_eh_frame_elf(const uint8_t *buf, size_t len)
+{
+    const Elf_Ehdr *ehdr = (const Elf_Ehdr *)buf;
+
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 ||
+        ehdr->e_shstrndx == 0 || ehdr->e_shstrndx >= ehdr->e_shnum)
+        return 0;
+
+    if (ehdr->e_shoff + (uint64_t)ehdr->e_shnum * ehdr->e_shentsize > len)
+        return 0;
+
+    const Elf_Shdr *shdrs = (const Elf_Shdr *)(buf + ehdr->e_shoff);
+    const Elf_Shdr *shstrtab_shdr = &shdrs[ehdr->e_shstrndx];
+
+    if (shstrtab_shdr->sh_offset + shstrtab_shdr->sh_size > len)
+        return 0;
+
+    const char *shstrs = (const char *)(buf + shstrtab_shdr->sh_offset);
+    uint64_t shstrs_size = shstrtab_shdr->sh_size;
+
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        if (shdrs[i].sh_name + 10 > shstrs_size)
+            continue;
+        if (memcmp(shstrs + shdrs[i].sh_name, ".eh_frame\0", 10) != 0)
+            continue;
+        if (!(shdrs[i].sh_flags & SHF_ALLOC))
+            continue;
+        if (shdrs[i].sh_size == 0)
+            continue;
+
+        uint64_t off = shdrs[i].sh_addr - base_vmaddr;
+        if (off + shdrs[i].sh_size > total_size) {
+            printf("  warning: .eh_frame extends past image\n");
+            continue;
+        }
+
+        eh_frame_off  = (uint32_t)off;
+        eh_frame_size = (uint32_t)shdrs[i].sh_size;
+        break;
+    }
+
+    return 0;
+}
+
 static int write_llbin(const char *path)
 {
     struct llbin_header hdr;
@@ -585,6 +807,18 @@ static int write_llbin(const char *path)
     hdr.export_off  = hdr.init_off +
                       ninits * (uint32_t)sizeof(struct llbin_init);
     hdr.export_count = nexports;
+    hdr.needed_off  = hdr.export_off +
+                      nexports * (uint32_t)sizeof(struct llbin_export);
+    hdr.needed_count = nneeded;
+    hdr.fini_off    = hdr.needed_off +
+                      nneeded * (uint32_t)sizeof(uint32_t);
+    hdr.fini_count = nfinis;
+    hdr.eh_frame_off  = eh_frame_off;
+    hdr.eh_frame_size = eh_frame_size;
+    hdr.tls_init_off   = tls_init_off;
+    hdr.tls_init_size  = tls_init_size;
+    hdr.tls_total_size = tls_total_size;
+    hdr.tls_align      = tls_align;
 
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return -1; }
@@ -600,6 +834,10 @@ static int write_llbin(const char *path)
         fwrite(inits, sizeof(struct llbin_init),     ninits,    f);
     if (nexports > 0)
         fwrite(exports, sizeof(struct llbin_export), nexports,  f);
+    if (nneeded > 0)
+        fwrite(needed_str, sizeof(uint32_t), nneeded, f);
+    if (nfinis > 0)
+        fwrite(finis, sizeof(struct llbin_init), nfinis, f);
 
     fclose(f);
     return 0;
@@ -645,8 +883,9 @@ int main(int argc, char *argv[])
     if (process_fixups_elf(buf, len) < 0)
         die("process_fixups_elf failed");
 
-    printf("  fixups:  %u (%u rebase, %u import)\n", nfixups,
-           nrebase_fixups, nfixups - nrebase_fixups);
+    printf("  fixups:  %u (%u rebase, %u import, %u ifunc)\n", nfixups,
+           nrebase_fixups, nfixups - nrebase_fixups - nirel_fixups,
+           nirel_fixups);
     printf("  imports: %u\n", nimports);
     for (uint32_t i = 0; i < nimports; i++)
         printf("    [%u] %s\n", i, strtab + imports[i].name_off);
@@ -659,6 +898,13 @@ int main(int argc, char *argv[])
         printf("    [%u] offset=0x%llx\n", i,
                (unsigned long long)inits[i].offset);
 
+    if (nfinis > 0) {
+        printf("  finis:   %u\n", nfinis);
+        for (uint32_t i = 0; i < nfinis; i++)
+            printf("    [%u] offset=0x%llx\n", i,
+                   (unsigned long long)finis[i].offset);
+    }
+
     if (process_exports_elf(buf, len) < 0)
         die("process_exports_elf failed");
 
@@ -667,6 +913,28 @@ int main(int argc, char *argv[])
         printf("    [%u] %s @ 0x%llx\n", i,
                strtab + exports[i].name_off,
                (unsigned long long)exports[i].addr_off);
+
+    if (process_eh_frame_elf(buf, len) < 0)
+        die("process_eh_frame_elf failed");
+
+    if (eh_frame_size > 0)
+        printf("  eh_frame: offset=0x%x size=0x%x\n", eh_frame_off, eh_frame_size);
+    else
+        printf("  eh_frame: (none)\n");
+
+    if (tls_total_size > 0)
+        printf("  tls: init_off=0x%x init_size=0x%x total=0x%x align=0x%x\n",
+               tls_init_off, tls_init_size, tls_total_size, tls_align);
+    else
+        printf("  tls: (none)\n");
+
+    if (nneeded > 0 && elf_dynstr) {
+        for (uint32_t i = 0; i < nneeded; i++)
+            needed_str[i] = add_string(elf_dynstr + needed_str[i]);
+        printf("  needed:  %u\n", nneeded);
+        for (uint32_t i = 0; i < nneeded; i++)
+            printf("    [%u] %s\n", i, strtab + needed_str[i]);
+    }
 
     if (write_llbin(argv[2]) < 0)
         die("write_llbin failed");
@@ -685,7 +953,9 @@ int main(int argc, char *argv[])
                         strtab_len +
                         (uint64_t)llseg_count * sizeof(struct llbin_segment) +
                         (uint64_t)ninits   * sizeof(struct llbin_init) +
-                        (uint64_t)nexports * sizeof(struct llbin_export);
+                         (uint64_t)nexports * sizeof(struct llbin_export) +
+                         (uint64_t)nneeded  * sizeof(uint32_t) +
+                         (uint64_t)nfinis   * sizeof(struct llbin_init);
     printf("  output: %s (%llu bytes)\n", argv[2], (unsigned long long)out_size);
 
     free(buf);

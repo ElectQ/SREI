@@ -277,7 +277,12 @@ def _print_llbin_info(data):
      strings_off, strings_size,
      seg_count,
      init_off, init_count,
-     export_off, export_count) = fields
+     export_off, export_count,
+     needed_off, needed_count,
+     fini_off, fini_count,
+     eh_frame_off, eh_frame_size,
+     tls_init_off, tls_init_size,
+     tls_total_size, tls_align) = fields
 
     arch_names = {
         0x01000007: 'x86_64',
@@ -299,6 +304,13 @@ def _print_llbin_info(data):
     print("  segments:       %d" % seg_count)
     print("  inits:          %d" % init_count)
     print("  exports:        %d" % export_count)
+    print("  needed:         %d" % needed_count)
+    print("  finis:          %d" % fini_count)
+    if eh_frame_size > 0:
+        print("  eh_frame:       off=0x%x size=0x%x" % (eh_frame_off, eh_frame_size))
+    if tls_total_size > 0:
+        print("  tls:            init_off=0x%x init_size=0x%x total=0x%x align=0x%x" % (
+            tls_init_off, tls_init_size, tls_total_size, tls_align))
     print("  total size:     %d" % len(data))
 
     if import_count > 0 and strings_off + strings_size <= len(data):
@@ -347,6 +359,18 @@ def _print_llbin_info(data):
             off = init_off + i * struct.calcsize(LLBIN_INIT_FMT)
             (ioff,) = struct.unpack_from(LLBIN_INIT_FMT, data, off)
             print("    [%d] offset=0x%x" % (i, ioff))
+
+    if needed_count > 0 and strings_off + strings_size <= len(data):
+        strtab = data[strings_off:strings_off + strings_size]
+        print()
+        print("  DT_NEEDED:")
+        for i in range(needed_count):
+            off = needed_off + i * 4
+            (name_off,) = struct.unpack_from('<I', data, off)
+            if name_off < len(strtab):
+                end = strtab.index(b'\x00', name_off)
+                name = strtab[name_off:end].decode('ascii')
+                print("    [%d] %s" % (i, name))
 
 
 def _print_elf_info(data):

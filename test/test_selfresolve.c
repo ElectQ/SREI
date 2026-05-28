@@ -46,9 +46,13 @@ static uint8_t *read_file(const char *path, size_t *out_len)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: test_selfresolve <file.llbin>\n");
+        fprintf(stderr, "Usage: test_selfresolve <file.llbin> [function_name] [user_data]\n");
         return 1;
     }
+
+    const char *func_name = argc >= 3 ? argv[2] : "payload_run";
+    const char *user_msg = argc >= 4 ? argv[3] : "hello from selfresolve";
+    uint32_t user_len = (uint32_t)strlen(user_msg);
 
     size_t len;
     uint8_t *data = read_file(argv[1], &len);
@@ -57,14 +61,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    uint32_t fhash = hash_name("payload_run");
+    uint32_t fhash = hash_name(func_name);
 
     printf("[test_selfresolve] loading %s (%zu bytes), hash=0x%08x\n",
            argv[1], len, fhash);
     printf("[test_selfresolve] passing NULL dlsym — loader must self-resolve\n");
 
     uintptr_t base = srei_load(data, len, fhash,
-                                "hello from selfresolve", 23,
+                                user_msg, user_len,
                                 NULL, 0);
 
     if (base == 0) {

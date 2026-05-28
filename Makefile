@@ -1,6 +1,6 @@
 CC      = gcc
 NASM    = nasm
-CFLAGS  = -Wall -Wextra -O2
+CFLAGS  = -Wall -Wextra -Os
 LDFLAGS =
 
 all: packer/llpack bin/loader_x86_64.bin test/libpayload.so test/payload.llbin native/native_loader bin/sc_test
@@ -16,7 +16,7 @@ bin/loader_x86_64.elf: loader/loader.o loader/linker.ld
 	ld.gold -shared -nostdlib -s -T loader/linker.ld -o $@ $<
 
 bin/loader_x86_64.bin: bin/loader_x86_64.elf
-	objcopy -O binary -j .text -j .rodata $< $@
+	objcopy -O binary -j .text -j .rodata -j .data -j .bss $< $@
 	@echo "  loader: `wc -c < $@` bytes"
 
 test/libpayload.so: test/payload.c

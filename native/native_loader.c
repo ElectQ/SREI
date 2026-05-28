@@ -48,9 +48,13 @@ static uint8_t *read_file(const char *path, size_t *out_len)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: native_loader <file.llbin|file.so>\n");
+        fprintf(stderr, "Usage: native_loader <file.llbin> [function_name] [user_data]\n");
         return 1;
     }
+
+    const char *func_name = argc >= 3 ? argv[2] : "payload_run";
+    const char *user_msg = argc >= 4 ? argv[3] : "hello from native_loader";
+    uint32_t user_len = (uint32_t)strlen(user_msg);
 
     size_t len;
     uint8_t *data = read_file(argv[1], &len);
@@ -59,12 +63,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    uint32_t fhash = hash_name("payload_run");
+    uint32_t fhash = hash_name(func_name);
 
     printf("[native_loader] loading %s (%zu bytes), hash=0x%08x\n",
            argv[1], len, fhash);
 
-    uintptr_t base = srei_load(data, len, fhash, "hello from native_loader", 25,
+    uintptr_t base = srei_load(data, len, fhash, user_msg, user_len,
                                 dlsym, 0);
 
     if (base == 0) {

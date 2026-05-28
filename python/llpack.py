@@ -8,9 +8,12 @@ by the SREI loader shellcode. No external binaries required.
 import struct
 
 LLBIN_MAGIC = 0x4E424C4C
-LLBIN_VERSION = 2
+LLBIN_VERSION = 5
 LLBIN_FIXUP_REBASE = 0
 LLBIN_FIXUP_IMPORT = 1
+LLBIN_FIXUP_IRELATIVE = 2
+LLBIN_FIXUP_TLS_MODULE = 3
+LLBIN_FIXUP_TLS_OFFSET = 4
 
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
@@ -30,11 +33,15 @@ EM_SPARC = 2
 
 PT_LOAD = 1
 PT_DYNAMIC = 2
-PF_R = 1
+PT_GNU_RELRO = 0x6474e552
+PF_X = 1
 PF_W = 2
-PF_X = 4
+PF_R = 4
+
+LLBIN_SEG_RELRO = 0x100
 
 DT_NULL = 0
+DT_NEEDED = 1
 DT_PLTRELSZ = 2
 DT_STRTAB = 5
 DT_SYMTAB = 6
@@ -47,8 +54,11 @@ DT_RELENT = 19
 DT_PLTREL = 20
 DT_JMPREL = 23
 DT_INIT = 12
+DT_FINI = 13
 DT_INIT_ARRAY = 25
 DT_INIT_ARRAYSZ = 27
+DT_FINI_ARRAY = 26
+DT_FINI_ARRAYSZ = 28
 
 SHT_DYNSYM = 11
 SHN_UNDEF = 0
@@ -57,16 +67,21 @@ R_X86_64_64 = 1
 R_X86_64_GLOB_DAT = 6
 R_X86_64_JUMP_SLOT = 7
 R_X86_64_RELATIVE = 8
+R_X86_64_DTPMOD64 = 16
+R_X86_64_DTPOFF64 = 17
+R_X86_64_IRELATIVE = 37
 
 R_AARCH64_ABS64 = 257
 R_AARCH64_GLOB_DAT = 1025
 R_AARCH64_JUMP_SLOT = 1026
 R_AARCH64_RELATIVE = 1027
+R_AARCH64_IRELATIVE = 1031
 
 R_386_32 = 1
 R_386_GLOB_DAT = 6
 R_386_JMP_SLOT = 7
 R_386_RELATIVE = 8
+R_386_IRELATIVE = 42
 
 R_ARM_ABS32 = 2
 R_ARM_GLOB_DAT = 21
@@ -84,7 +99,7 @@ ARCH_MAP = {
     EM_SPARC: 0x00000002,
 }
 
-LLBIN_HEADER_FMT = '<IIIIQQQIIIIIIIIIIII'
+LLBIN_HEADER_FMT = '<IIIIQQQIIIIIIIIIIIIIIIIIIIIII'
 LLBIN_HEADER_SIZE = struct.calcsize(LLBIN_HEADER_FMT)
 
 LLBIN_FIXUP_FMT = '<IBBhq'
@@ -99,7 +114,9 @@ LLBIN_EXPORT_FMT = '<IIQ'
 class PackerState(object):
     __slots__ = ('image', 'base_vmaddr', 'total_size', 'entry_off',
                  'segments', 'fixups', 'imports', 'inits', 'exports',
-                 'strtab', 'arch', 'is_64', 'e_machine')
+                 'strtab', 'arch', 'is_64', 'e_machine',
+                 'needed', 'finis', 'eh_frame_off', 'eh_frame_size',
+                 'tls_init_off', 'tls_init_size', 'tls_total_size', 'tls_align')
 
     def __init__(self):
         self.image = bytearray()
@@ -115,6 +132,14 @@ class PackerState(object):
         self.arch = 0
         self.is_64 = True
         self.e_machine = 0
+        self.needed = []
+        self.finis = []
+        self.eh_frame_off = 0
+        self.eh_frame_size = 0
+        self.tls_init_off = 0
+        self.tls_init_size = 0
+        self.tls_total_size = 0
+        self.tls_align = 0
 
     def find_or_add_import(self, name):
         for i, imp_name in enumerate(self.imports):
@@ -154,6 +179,28 @@ def _is_import(machine, rtype, rsym):
         return rtype in (R_386_GLOB_DAT, R_386_JMP_SLOT, R_386_32)
     if machine == EM_ARM:
         return rtype in (R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_ABS32)
+    return False
+
+
+def _is_irelative(machine, rtype):
+    if machine == EM_X86_64:
+        return rtype == R_X86_64_IRELATIVE
+    if machine == EM_AARCH64:
+        return rtype == R_AARCH64_IRELATIVE
+    if machine == EM_386:
+        return rtype == R_386_IRELATIVE
+    return False
+
+
+def _is_tls_module(machine, rtype):
+    if machine == EM_X86_64:
+        return rtype == R_X86_64_DTPMOD64
+    return False
+
+
+def _is_tls_offset(machine, rtype):
+    if machine == EM_X86_64:
+        return rtype == R_X86_64_DTPOFF64
     return False
 
 
@@ -232,6 +279,38 @@ def build_image_elf(st, data):
 
         st.segments.append((p_vaddr, p_memsz, p_offset, p_filesz, prot))
 
+    for (p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz) in phdrs:
+        if p_type == PT_GNU_RELRO and p_memsz > 0:
+            st.segments.append((p_vaddr, p_memsz, p_offset, p_filesz, 4 | LLBIN_SEG_RELRO))
+            break
+
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        if st.is_64:
+            p_type = struct.unpack_from('<I', data, off)[0]
+            if p_type == 7:
+                p_vaddr = struct.unpack_from('<Q', data, off + 16)[0]
+                p_filesz = struct.unpack_from('<Q', data, off + 32)[0]
+                p_memsz = struct.unpack_from('<Q', data, off + 40)[0]
+                p_align = struct.unpack_from('<Q', data, off + 48)[0]
+                st.tls_init_off = p_vaddr - lo
+                st.tls_init_size = p_filesz
+                st.tls_total_size = p_memsz
+                st.tls_align = p_align
+                break
+        else:
+            p_type = struct.unpack_from('<I', data, off)[0]
+            if p_type == 7:
+                p_vaddr = struct.unpack_from('<I', data, off + 8)[0]
+                p_filesz = struct.unpack_from('<I', data, off + 16)[0]
+                p_memsz = struct.unpack_from('<I', data, off + 20)[0]
+                p_align = struct.unpack_from('<I', data, off + 24)[0]
+                st.tls_init_off = p_vaddr - lo
+                st.tls_init_size = p_filesz
+                st.tls_total_size = p_memsz
+                st.tls_align = p_align
+                break
+
 
 def _find_dynamic_in_elf(st, data):
     if st.is_64:
@@ -264,10 +343,11 @@ def _find_dynamic_in_elf(st, data):
 def _parse_dynamic_entries(st, data):
     dyn_vaddr, dyn_filesz = _find_dynamic_in_elf(st, data)
     if dyn_vaddr == 0:
-        return {}
+        return {}, []
 
     dyn_off = dyn_vaddr - st.base_vmaddr
     result = {}
+    needed_list = []
 
     if st.is_64:
         fmt = '<qQ'
@@ -283,9 +363,12 @@ def _parse_dynamic_entries(st, data):
         pos += entry_sz
         if d_tag == DT_NULL:
             break
-        result[d_tag] = d_val
+        if d_tag == DT_NEEDED:
+            needed_list.append(d_val)
+        else:
+            result[d_tag] = d_val
 
-    return result
+    return result, needed_list
 
 
 def _find_phdr_for_vaddr(st, data, vaddr):
@@ -343,7 +426,7 @@ def _read_sym_name(st, sym_idx, symtab_off, strtab_off):
 
 
 def process_elf_relocations(st, data):
-    dyn = _parse_dynamic_entries(st, data)
+    dyn, _ = _parse_dynamic_entries(st, data)
     if not dyn:
         return
 
@@ -372,6 +455,23 @@ def process_elf_relocations(st, data):
     slot_fmt = '<Q' if st.is_64 else '<I'
     slot_mask = (1 << (slot_sz * 8)) - 1
 
+    def _sym_local(rs):
+        if rs == 0 or symtab_off == 0:
+            return False, 0
+        if st.is_64:
+            se = symtab_off + rs * 24
+            if se + 24 > len(st.image):
+                return False, 0
+            shndx = struct.unpack_from('<H', st.image, se + 6)[0]
+            val = struct.unpack_from('<Q', st.image, se + 8)[0]
+        else:
+            se = symtab_off + rs * 16
+            if se + 16 > len(st.image):
+                return False, 0
+            shndx = struct.unpack_from('<H', st.image, se + 14)[0]
+            val = struct.unpack_from('<I', st.image, se + 4)[0]
+        return shndx != 0, val
+
     def process_rela(table_addr, table_sz):
         if table_addr == 0 or table_sz == 0 or rela_ent == 0:
             return
@@ -390,12 +490,35 @@ def process_elf_relocations(st, data):
                 struct.pack_into(slot_fmt, st.image, img_off,
                                  r_addend & slot_mask)
                 st.add_fixup(img_off, LLBIN_FIXUP_REBASE)
+            elif _is_irelative(st.e_machine, rt):
+                struct.pack_into(slot_fmt, st.image, img_off,
+                                 r_addend & slot_mask)
+                st.add_fixup(img_off, LLBIN_FIXUP_IRELATIVE)
             elif _is_import(st.e_machine, rt, rs):
-                name = _read_sym_name(st, rs, symtab_off, strtab_off)
-                if name:
-                    idx = st.find_or_add_import(name)
+                is_local, sym_val = _sym_local(rs)
+                if is_local:
+                    struct.pack_into(slot_fmt, st.image, img_off,
+                                     (sym_val + r_addend) & slot_mask)
+                    st.add_fixup(img_off, LLBIN_FIXUP_REBASE)
+                else:
+                    name = _read_sym_name(st, rs, symtab_off, strtab_off)
+                    if name:
+                        idx = st.find_or_add_import(name)
+                        struct.pack_into(slot_fmt, st.image, img_off, 0)
+                        st.add_fixup(img_off, LLBIN_FIXUP_IMPORT, idx, r_addend)
+            elif _is_tls_module(st.e_machine, rt):
+                struct.pack_into(slot_fmt, st.image, img_off, 0)
+                st.add_fixup(img_off, LLBIN_FIXUP_TLS_MODULE)
+            elif _is_tls_offset(st.e_machine, rt):
+                is_local, sym_val = _sym_local(rs)
+                if is_local:
+                    struct.pack_into(slot_fmt, st.image, img_off,
+                                     (sym_val + r_addend) & slot_mask)
+                elif rs == 0:
+                    struct.pack_into(slot_fmt, st.image, img_off,
+                                     r_addend & slot_mask)
+                else:
                     struct.pack_into(slot_fmt, st.image, img_off, 0)
-                    st.add_fixup(img_off, LLBIN_FIXUP_IMPORT, idx, r_addend)
 
     def process_rel(table_addr, table_sz):
         if table_addr == 0 or table_sz == 0 or rel_ent == 0:
@@ -413,13 +536,29 @@ def process_elf_relocations(st, data):
 
             if _is_relative(st.e_machine, rt, rs):
                 st.add_fixup(img_off, LLBIN_FIXUP_REBASE)
+            elif _is_irelative(st.e_machine, rt):
+                st.add_fixup(img_off, LLBIN_FIXUP_IRELATIVE)
             elif _is_import(st.e_machine, rt, rs):
-                addend = struct.unpack_from(slot_fmt, st.image, img_off)[0]
-                name = _read_sym_name(st, rs, symtab_off, strtab_off)
-                if name:
-                    idx = st.find_or_add_import(name)
-                    struct.pack_into(slot_fmt, st.image, img_off, 0)
-                    st.add_fixup(img_off, LLBIN_FIXUP_IMPORT, idx, addend)
+                is_local, sym_val = _sym_local(rs)
+                if is_local:
+                    struct.pack_into(slot_fmt, st.image, img_off,
+                                     sym_val & slot_mask)
+                    st.add_fixup(img_off, LLBIN_FIXUP_REBASE)
+                else:
+                    addend = struct.unpack_from(slot_fmt, st.image, img_off)[0]
+                    name = _read_sym_name(st, rs, symtab_off, strtab_off)
+                    if name:
+                        idx = st.find_or_add_import(name)
+                        struct.pack_into(slot_fmt, st.image, img_off, 0)
+                        st.add_fixup(img_off, LLBIN_FIXUP_IMPORT, idx, addend)
+            elif _is_tls_module(st.e_machine, rt):
+                struct.pack_into(slot_fmt, st.image, img_off, 0)
+                st.add_fixup(img_off, LLBIN_FIXUP_TLS_MODULE)
+            elif _is_tls_offset(st.e_machine, rt):
+                is_local, sym_val = _sym_local(rs)
+                if is_local:
+                    struct.pack_into(slot_fmt, st.image, img_off,
+                                     sym_val & slot_mask)
 
     process_rela(rela_addr, rela_sz)
     process_rel(rel_addr, rel_sz)
@@ -432,13 +571,16 @@ def process_elf_relocations(st, data):
 
 
 def process_elf_inits(st, data):
-    dyn = _parse_dynamic_entries(st, data)
+    dyn, _ = _parse_dynamic_entries(st, data)
     if not dyn:
         return
 
     dt_init = dyn.get(DT_INIT, 0)
     dt_init_array = dyn.get(DT_INIT_ARRAY, 0)
     dt_init_arraysz = dyn.get(DT_INIT_ARRAYSZ, 0)
+    dt_fini = dyn.get(DT_FINI, 0)
+    dt_fini_array = dyn.get(DT_FINI_ARRAY, 0)
+    dt_fini_arraysz = dyn.get(DT_FINI_ARRAYSZ, 0)
 
     if dt_init != 0:
         st.inits.append(dt_init - st.base_vmaddr)
@@ -463,6 +605,26 @@ def process_elf_inits(st, data):
             if entry == 0:
                 continue
             st.inits.append(entry - st.base_vmaddr)
+
+    if dt_fini != 0:
+        st.finis.append(dt_fini - st.base_vmaddr)
+
+    if dt_fini_array != 0 and dt_fini_arraysz != 0:
+        result = _find_phdr_for_vaddr(st, data, dt_fini_array)
+        if result:
+            seg_vaddr, seg_offset = result
+            arr_fileoff = dt_fini_array - seg_vaddr + seg_offset
+        else:
+            arr_fileoff = dt_fini_array
+
+        for i in range(count):
+            pos = arr_fileoff + i * ptr_sz
+            if pos + ptr_sz > len(data):
+                break
+            entry = struct.unpack_from(ptr_fmt, data, pos)[0]
+            if entry == 0:
+                continue
+            st.finis.append(entry - st.base_vmaddr)
 
 
 def process_elf_exports(st, data):
@@ -557,6 +719,95 @@ def process_elf_exports(st, data):
         st.exports.append((name_off, 0, st_value - st.base_vmaddr))
 
 
+def process_elf_needed(st, data):
+    dyn, needed_offsets = _parse_dynamic_entries(st, data)
+    if not needed_offsets:
+        return
+
+    strtab_addr = dyn.get(DT_STRTAB, 0) if dyn else 0
+    if strtab_addr == 0:
+        return
+    dynstr = st.image[strtab_addr - st.base_vmaddr:]
+
+    for off in needed_offsets:
+        nul = dynstr.find(b'\x00', off)
+        if nul < 0:
+            continue
+        name = dynstr[off:nul].decode('ascii')
+        if name:
+            name_off = st.add_string(name)
+            st.needed.append(name_off)
+
+
+def process_elf_eh_frame(st, data):
+    if st.is_64:
+        if len(data) < 64:
+            return
+        e_shoff = struct.unpack_from('<Q', data, 40)[0]
+        e_shentsize = struct.unpack_from('<H', data, 58)[0]
+        e_shnum = struct.unpack_from('<H', data, 60)[0]
+        e_shstrndx = struct.unpack_from('<H', data, 62)[0]
+    else:
+        if len(data) < 52:
+            return
+        e_shoff = struct.unpack_from('<I', data, 32)[0]
+        e_shentsize = struct.unpack_from('<H', data, 46)[0]
+        e_shnum = struct.unpack_from('<H', data, 48)[0]
+        e_shstrndx = struct.unpack_from('<H', data, 50)[0]
+
+    if e_shoff == 0 or e_shnum == 0 or e_shstrndx == 0 or e_shstrndx >= e_shnum:
+        return
+    if e_shoff + e_shnum * e_shentsize > len(data):
+        return
+
+    if st.is_64:
+        shstrtab_off = struct.unpack_from('<Q', data,
+            e_shoff + e_shstrndx * e_shentsize + 24)[0]
+        shstrtab_size = struct.unpack_from('<Q', data,
+            e_shoff + e_shstrndx * e_shentsize + 32)[0]
+    else:
+        shstrtab_off = struct.unpack_from('<I', data,
+            e_shoff + e_shstrndx * e_shentsize + 16)[0]
+        shstrtab_size = struct.unpack_from('<I', data,
+            e_shoff + e_shstrndx * e_shentsize + 20)[0]
+
+    if shstrtab_off + shstrtab_size > len(data):
+        return
+
+    shstrs = data[shstrtab_off:shstrtab_off + shstrtab_size]
+    target = b'.eh_frame\x00'
+
+    for i in range(e_shnum):
+        sh_off = e_shoff + i * e_shentsize
+        if st.is_64:
+            sh_name = struct.unpack_from('<I', data, sh_off)[0]
+            sh_flags = struct.unpack_from('<Q', data, sh_off + 8)[0]
+            sh_addr = struct.unpack_from('<Q', data, sh_off + 16)[0]
+            sh_size = struct.unpack_from('<Q', data, sh_off + 32)[0]
+        else:
+            sh_name = struct.unpack_from('<I', data, sh_off)[0]
+            sh_flags = struct.unpack_from('<I', data, sh_off + 4)[0]
+            sh_addr = struct.unpack_from('<I', data, sh_off + 12)[0]
+            sh_size = struct.unpack_from('<I', data, sh_off + 20)[0]
+
+        if sh_name + 10 > shstrtab_size:
+            continue
+        if shstrs[sh_name:sh_name + 10] != target:
+            continue
+        if not (sh_flags & 0x2):
+            continue
+        if sh_size == 0:
+            continue
+
+        off = sh_addr - st.base_vmaddr
+        if off + sh_size > st.total_size:
+            continue
+
+        st.eh_frame_off = off
+        st.eh_frame_size = sh_size
+        break
+
+
 def write_llbin(st):
     import_entries = []
     for imp_name in st.imports:
@@ -583,6 +834,8 @@ def write_llbin(st):
     seg_table_off = strings_off + len(st.strtab)
     init_off = seg_table_off + len(seg_entries) * segment_size
     export_off = init_off + len(st.inits) * init_size
+    needed_off = export_off + len(st.exports) * export_size
+    fini_off = needed_off + len(st.needed) * 4
 
     hdr = struct.pack(LLBIN_HEADER_FMT,
                       LLBIN_MAGIC, LLBIN_VERSION, st.arch, 0,
@@ -593,7 +846,12 @@ def write_llbin(st):
                       strings_off, len(st.strtab),
                       len(seg_entries),
                       init_off, len(st.inits),
-                      export_off, len(st.exports))
+                      export_off, len(st.exports),
+                       needed_off, len(st.needed),
+                       fini_off, len(st.finis),
+                       st.eh_frame_off, st.eh_frame_size,
+                       st.tls_init_off, st.tls_init_size,
+                       st.tls_total_size, st.tls_align)
 
     out = bytearray()
     out += hdr
@@ -617,6 +875,12 @@ def write_llbin(st):
     for (name_off, flags, addr_off) in st.exports:
         out += struct.pack(LLBIN_EXPORT_FMT, name_off, flags, addr_off)
 
+    for name_off in st.needed:
+        out += struct.pack('<I', name_off)
+
+    for fini_offset in st.finis:
+        out += struct.pack(LLBIN_INIT_FMT, fini_offset)
+
     return bytes(out)
 
 
@@ -636,8 +900,9 @@ def convert_elf_to_llbin(data, verbose=False):
     if verbose:
         nrebase = sum(1 for f in st.fixups if f[1] == LLBIN_FIXUP_REBASE)
         nimport = sum(1 for f in st.fixups if f[1] == LLBIN_FIXUP_IMPORT)
-        print("  fixups:  %d (%d rebase, %d import)" % (
-            len(st.fixups), nrebase, nimport))
+        nifunc = sum(1 for f in st.fixups if f[1] == LLBIN_FIXUP_IRELATIVE)
+        print("  fixups:  %d (%d rebase, %d import, %d ifunc)" % (
+            len(st.fixups), nrebase, nimport, nifunc))
         print("  imports: %d" % len(st.imports))
         for i, name in enumerate(st.imports):
             print("    [%d] %s" % (i, name))
@@ -655,6 +920,30 @@ def convert_elf_to_llbin(data, verbose=False):
         print("  exports: %d" % len(st.exports))
         for i, (name_off, flags, addr_off) in enumerate(st.exports):
             print("    [%d] @ 0x%x" % (i, addr_off))
+
+    process_elf_needed(st, data)
+
+    if verbose:
+        print("  needed:  %d" % len(st.needed))
+        for i, name_off in enumerate(st.needed):
+            end = st.strtab.find(b'\x00', name_off)
+            name = st.strtab[name_off:end].decode('ascii') if end >= 0 else '?'
+            print("    [%d] %s" % (i, name))
+
+    process_elf_eh_frame(st, data)
+
+    if verbose:
+        if st.eh_frame_size > 0:
+            print("  eh_frame: offset=0x%x size=0x%x" % (
+                st.eh_frame_off, st.eh_frame_size))
+        else:
+            print("  eh_frame: (none)")
+
+        if st.tls_total_size > 0:
+            print("  tls: init_off=0x%x init_size=0x%x total=0x%x align=0x%x" % (
+                st.tls_init_off, st.tls_init_size, st.tls_total_size, st.tls_align))
+        else:
+            print("  tls: (none)")
 
     result = write_llbin(st)
 
